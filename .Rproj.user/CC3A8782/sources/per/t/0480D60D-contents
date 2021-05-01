@@ -1,0 +1,78 @@
+library(faraway)
+data(epilepsy, package = 'faraway')
+epilepsy$period <- rep(0:4, 59)
+epilepsy$drug <- factor(c('placebo', 'treatment')[epilepsy$treat+1])
+epilepsy$phase <- factor(c('baseline', 'experiment')[epilepsy$expind+1])
+epilepsy[epilepsy$id < 2.5, ]
+
+library(dplyr)
+epilepsy %>% 
+  group_by(drug, phase) %>% 
+  summarise(rate=mean(seizures/timeadj)) %>% 
+  xtabs(formula = rate ~ phase + drug)
+
+library(ggplot2)
+ggplot(epilepsy, aes(x=period, y=seizures, linetype=drug, group=id)) +
+  geom_line() +
+  xlim(1,4) +
+  scale_y_sqrt(breaks=(0:10)^2) +
+  theme(legend.position = 'top', legend.direction='horizontal')
+
+epilo <- filter(epilepsy, id != 49)
+
+modglm <- glm(seizures ~offset(log(timeadj)) + expind + treat + I(expind*treat),
+              family=poisson, data=epilo)
+sumary(modglm)
+
+library(MASS)
+modpql <- glmmPQL(seizures ~ offset(log(timeadj)) + expind + treat +
+                    I(expind*treat), random = ~1|id, family=poisson, data=epilo)
+summary(modpql)
+
+library(lme4)
+modgh <- glmer(seizures ~ offset(log(timeadj)) + expind + treat + I(expind*treat) +
+                 (1|id), nAGQ = 25, family=poisson, data=epilo)
+summary(modgh)
+
+exp(-0.302)
+
+epilo$id[epilo$id == 59] <- 49
+xm <- model.matrix( ~ expind + treat + I(expind*treat), epilo)
+epildat <- with(epilo, list(Nobs=nrow(epilo), Nsubs=length(unique(id)), 
+                            Npreds = ncol(xm),
+                            y = seizures, 
+                            subject = id,
+                            x = xm,
+                            offset = timeadj))
+
+library(rstan)
+rt <- stanc('glmmpois.stan')
+sm <- stan_model(stanc_ret = rt, verbose = FALSE)
+fit <- sampling(sm, data=epildat)
+
+traceplot(fit, pars='sigmasubj', inc_warmup = FALSE)
+
+ipars <- data.frame(rstan::extract(fit, pars=c('sigmasubj', 'beta')))
+colnames(ipars) <- c('subject', 'intercept', 'expind', 'treat','interaction')
+
+ggplot(ipars, aes(x=subject)) + geom_density()
+ggplot(ipars, aes(x=interaction)) + geom_density() + geom_vline(xintercept = 0)
+
+bayespval <- function(x) {p <- mean(x>0); 2*min(p, 1-p)}
+smat <- apply(ipars, 2, function(x){
+  c(mean(x), quantile(x, c(0.025, 0.975)), bayespval(x))
+})
+row.names(smat) <- c('mean', 'LCB', 'UCB', 'pvalue')
+t(smat)
+
+formula <- seizures ~ offset(log(timeadj)) + expind + treat + I(expind*treat) + f(id, model='iid')
+library(INLA)
+result <- inla(formula, family='poisson', data=epilo)
+
+sigmaalpha <- inla.tmarginal(function(x){
+  1/sqrt(x)
+}, result$marginals.hyperpar$'Precision for id')
+restab <- sapply(result$marginals.fixed, function(x){inla.zmarginal(x, silent = TRUE)})
+restab <- cbind(restab, inla.zmarginal(sigmaalpha, silent = TRUE))
+colnames(restab) = c('mu', 'expind', 'treat', 'interaction', 'alpha')
+data.frame(restab)
